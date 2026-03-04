@@ -120,13 +120,13 @@ docker compose restart
 
 # 强制重新导入
 docker compose exec metatube-csv python metatube_csv_server.py \
-  --csv /data/BB_Magnet.csv --db /data/movies.db --reimport
+  --csv /data/BB_Magnet.csv --reimport
 docker compose restart
 
 # 查看数据库内容
 docker exec metatube-csv-server python -c "
 import sqlite3
-conn = sqlite3.connect('/data/movies.db')
+conn = sqlite3.connect('/data/BB_Magnet.db')
 for row in conn.execute('SELECT id, title, maker FROM movies LIMIT 5'):
     print(f'{row[0]} | {row[1]} | {row[2]}')
 conn.close()
@@ -148,7 +148,7 @@ metatube_csv/
 ├── README.md                # 本文档
 └── data/                    # 数据目录（运行时创建）
     ├── BB_Magnet.csv        # 你的 CSV 数据
-    └── movies.db            # SQLite 数据库（自动生成）
+    └── BB_Magnet.db          # SQLite 数据库（自动生成）
 ```
 
 ## 依赖
