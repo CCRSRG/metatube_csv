@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+*.db
+data/
+.git
+.gitignore
+README.md
+csv_template.csv
