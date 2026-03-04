@@ -55,6 +55,7 @@ class AppConfig:
     provider: str = "csv"
     db_path: str = ""
     fallback_server: str = ""
+    token: str = ""  # Bearer Token，空则不验证
 
 
 config = AppConfig()
@@ -222,6 +223,107 @@ def crop_image(image_data: bytes, ratio: float, pos: float = -1, quality: int = 
         img = img.convert("RGB")
     img.save(output, format="JPEG", quality=quality, optimize=True)
     return output.getvalue(), "image/jpeg"
+
+
+# 角标图片缓存（避免重复下载）
+_badge_cache: dict[str, bytes] = {}
+
+# 脚本所在目录
+_script_dir = Path(__file__).parent
+
+
+async def _load_badge_image(badge_ref: str) -> Optional[bytes]:
+    """
+    加载角标图片数据。
+    支持三种来源（按优先级）：
+      1. 本地文件路径（绝对路径）
+      2. 短文件名 → 脚本同目录 badges/ 子目录
+      3. 完整 HTTP URL → 远程下载
+    加载成功后缓存到内存，避免重复 IO/网络请求。
+    """
+    if badge_ref in _badge_cache:
+        return _badge_cache[badge_ref]
+
+    badge_data: Optional[bytes] = None
+
+    if badge_ref.startswith(("http://", "https://")):
+        # 远程 URL
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.get(badge_ref)
+                if resp.status_code == 200:
+                    badge_data = resp.content
+                else:
+                    logger.warning("角标下载失败 [%d]: %s", resp.status_code, badge_ref)
+        except Exception as e:
+            logger.warning("角标下载异常: %s", str(e))
+    else:
+        # 本地文件：先检查绝对路径，再检查 badges/ 子目录
+        candidates = [
+            Path(badge_ref),
+            _script_dir / "badges" / badge_ref,
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                badge_data = candidate.read_bytes()
+                logger.info("从本地加载角标: %s", candidate)
+                break
+
+        # 本地找不到 → 尝试从 MetaTube 原始项目 GitHub 下载
+        if not badge_data:
+            github_url = f"https://raw.githubusercontent.com/metatube-community/metatube-sdk-go/main/imageutil/badge/{badge_ref}"
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                    resp = await client.get(github_url)
+                    if resp.status_code == 200:
+                        badge_data = resp.content
+                        # 保存到本地 badges/ 目录以便下次直接使用
+                        local_path = _script_dir / "badges" / badge_ref
+                        local_path.parent.mkdir(parents=True, exist_ok=True)
+                        local_path.write_bytes(badge_data)
+                        logger.info("从 GitHub 下载角标并缓存到本地: %s", local_path)
+            except Exception as e:
+                logger.warning("从 GitHub 下载角标失败: %s", str(e))
+
+    if badge_data:
+        _badge_cache[badge_ref] = badge_data
+    return badge_data
+
+
+async def overlay_badge(image_data: bytes, badge_ref: str, quality: int = 90) -> tuple[bytes, str]:
+    """
+    将角标图片叠加到封面图左上角。
+    badge_ref: 角标来源（完整 URL / 本地路径 / 短文件名如 'zimu.png'）
+    quality: JPEG 输出质量
+    返回 (合成后的图片字节, content_type)
+    """
+    badge_data = await _load_badge_image(badge_ref)
+    if not badge_data:
+        logger.warning("无法加载角标 '%s'，返回原图", badge_ref)
+        return image_data, "image/jpeg"
+
+    # 打开封面图和角标图
+    cover = Image.open(io.BytesIO(image_data))
+    badge = Image.open(io.BytesIO(badge_data)).convert("RGBA")
+
+    # 按封面高度的 20% 缩放角标（与原始 Go 后端保持一致）
+    badge_target_h = int(cover.height * 0.2)
+    badge_scale = badge_target_h / badge.height
+    badge_target_w = int(badge.width * badge_scale)
+    badge = badge.resize((badge_target_w, badge_target_h), Image.LANCZOS)
+
+    # 确保封面图为 RGBA 以支持透明叠加
+    if cover.mode != "RGBA":
+        cover = cover.convert("RGBA")
+
+    # 叠加到左上角
+    cover.paste(badge, (0, 0), badge)
+
+    # 输出为 JPEG（去掉 Alpha 通道）
+    output = io.BytesIO()
+    cover.convert("RGB").save(output, format="JPEG", quality=quality, optimize=True)
+    return output.getvalue(), "image/jpeg"
+
 
 # ============================================================
 # SQLite 数据库操作
@@ -401,6 +503,41 @@ def row_to_info(row: sqlite3.Row) -> dict:
 # FastAPI 应用
 # ============================================================
 app = FastAPI(title="MetaTube CSV Server", version=VERSION)
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    """
+    Bearer Token 认证中间件。
+    仅当 config.token 非空时启用认证，
+    首页 / 免认证（用于健康检查）。
+    支持两种传递方式：
+      1. 请求头: Authorization: Bearer <token>
+      2. 查询参数: ?token=<token>（方便浏览器调试）
+    """
+    if config.token:
+        # 首页免认证
+        if request.url.path != "/":
+            provided_token = ""
+            # 优先从请求头获取
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer "):
+                provided_token = auth_header[7:]
+            else:
+                # 回退到查询参数
+                provided_token = request.query_params.get("token", "")
+
+            if not provided_token:
+                return JSONResponse(
+                    status_code=401,
+                    content={"data": None, "error": {"code": 401, "message": "Missing authorization token"}},
+                )
+            if provided_token != config.token:
+                return JSONResponse(
+                    status_code=401,
+                    content={"data": None, "error": {"code": 401, "message": "Invalid authorization token"}},
+                )
+    return await call_next(request)
 
 
 def success_response(data):
@@ -715,6 +852,14 @@ async def get_image(
                 except Exception as e:
                     logger.warning("图片裁剪失败，返回原图: %s", str(e))
 
+            # 叠加角标（如中文字幕标记）
+            if badge:
+                try:
+                    image_data, content_type = await overlay_badge(image_data, badge, quality)
+                    logger.info("已叠加角标: %s", badge)
+                except Exception as e:
+                    logger.warning("角标叠加失败，返回原图: %s", str(e))
+
             return Response(
                 content=image_data,
                 media_type=content_type,
@@ -758,6 +903,7 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="监听端口（默认 8000）")
     parser.add_argument("--reimport", action="store_true", help="强制重新导入 CSV（忽略已有数据库）")
     parser.add_argument("--fallback", default="", help="真实 MetaTube Server 地址，本地查不到时回退（如 http://metatube:8080）")
+    parser.add_argument("--token", default="", help="Bearer Token 认证密钥（空则不启用认证）")
     args = parser.parse_args()
 
     # 配置应用
@@ -769,6 +915,10 @@ def main():
     config.fallback_server = args.fallback.rstrip("/") if args.fallback else ""
     if config.fallback_server:
         logger.info("回退服务端: %s", config.fallback_server)
+
+    config.token = args.token or ""
+    if config.token:
+        logger.info("已启用 Bearer Token 认证")
 
     # 初始化数据库
     init_db()

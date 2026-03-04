@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 COPY metatube_csv_server.py .
+COPY badges/ ./badges/
 
 EXPOSE 8000
 
