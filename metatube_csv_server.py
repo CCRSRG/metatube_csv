@@ -516,8 +516,9 @@ async def auth_middleware(request, call_next):
       2. 查询参数: ?token=<token>（方便浏览器调试）
     """
     if config.token:
-        # 首页免认证
-        if request.url.path != "/":
+        # 首页和图片接口免认证
+        # （原始 C# 插件的 GetImageResponse 不发送 Authorization 头）
+        if request.url.path != "/" and not request.url.path.startswith("/v1/images/"):
             provided_token = ""
             # 优先从请求头获取
             auth_header = request.headers.get("authorization", "")

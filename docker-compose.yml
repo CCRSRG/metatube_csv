@@ -10,6 +10,8 @@ services:
     restart: always
     env_file:
       - .env
+    environment:
+      - TZ=Asia/Shanghai
     # 所有路径和配置在 .env 中管理，数据库路径默认与 CSV 同名（.db 后缀）
     command: ["--csv", "${CSV_PATH:-/data/BB_Magnet.csv}", "--port", "8000", "--fallback", "${FALLBACK_URL:-}", "--token", "${TOKEN:-}"]
     healthcheck:

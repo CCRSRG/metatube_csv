@@ -67,6 +67,8 @@ python metatube_csv_server.py --csv BB_Magnet.csv --port 8000
 
 > **自动重新导入**：当 CSV 文件的修改时间比数据库更新时，会自动重新导入，无需手动指定 `--reimport`。
 
+> **Token 认证范围**：首页 `/` 和图片接口 `/v1/images/*` 免认证（原始 MetaTube 插件的图片请求不发送 Token），其他 API 接口支持请求头 `Authorization: Bearer <token>` 和查询参数 `?token=<token>` 两种方式。
+
 ## 环境变量（Docker 部署）
 
 Docker 部署时通过 `.env` 文件配置，参考 `.env.example`：
@@ -77,6 +79,8 @@ Docker 部署时通过 `.env` 文件配置，参考 `.env.example`：
 | `DB_PATH` | SQLite 数据库路径（可选） | 与 CSV 同名 `.db` |
 | `FALLBACK_URL` | 真实 MetaTube Server 地址 | 空（不回退） |
 | `TOKEN` | Bearer Token 认证密钥 | 空（不启用认证） |
+
+> **时区配置**：Docker 容器默认为 UTC 时区，已在 `docker-compose.yml` 中设置 `TZ=Asia/Shanghai`，如需修改请编辑该文件。
 
 ## CSV 格式
 
