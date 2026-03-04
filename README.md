@@ -30,7 +30,10 @@ cp .env.example .env
 # 3. 构建并启动
 docker compose up -d --build
 
-# 4. 查看日志
+# 4. 清理无效镜像
+docker image prune -f
+
+# 5. 查看日志
 docker logs -f metatube-csv-server
 ```
 

@@ -5,12 +5,13 @@ MetaTube CSV Server — 伪造的 MetaTube 后端服务
 使 Jellyfin 的 MetaTube 插件能够从 CSV 中搜索和获取元数据。
 
 使用方法：
-    pip install fastapi uvicorn httpx
+    pip install fastapi uvicorn httpx Pillow
     python metatube_csv_server.py --csv data.csv --port 8000
 """
 
 import argparse
 import csv
+import io
 import json
 import re
 import os
@@ -22,6 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from PIL import Image
 
 import httpx
 from fastapi import FastAPI, Query, Response
@@ -174,6 +177,51 @@ def detect_encoding(filepath: Path) -> str:
         pass
     return "utf-8"
 
+
+def crop_image(image_data: bytes, ratio: float, pos: float = -1, quality: int = 90) -> tuple[bytes, str]:
+    """
+    根据目标宽高比裁剪图片。
+    ratio: 目标宽高比（宽/高），如 0.67 表示 2:3 竖版海报
+    pos: 裁剪位置（0.0~1.0），-1 表示自动（默认右半部分）
+    quality: JPEG 质量（1-100）
+    返回 (裁剪后的图片字节, content_type)
+    """
+    img = Image.open(io.BytesIO(image_data))
+    w, h = img.size
+    current_ratio = w / h
+
+    # 如果目标比例和当前比例接近，无需裁剪
+    if abs(current_ratio - ratio) < 0.05:
+        return image_data, "image/jpeg"
+
+    if ratio < current_ratio:
+        # 需要裁剪宽度（横图→竖图）
+        new_w = int(h * ratio)
+        if pos < 0:
+            # 默认取右半部分（封面主体通常在右侧）
+            pos = 1.0
+        # pos=0 取最左，pos=1 取最右
+        max_offset = w - new_w
+        x_offset = int(max_offset * max(0.0, min(1.0, pos)))
+        crop_box = (x_offset, 0, x_offset + new_w, h)
+    else:
+        # 需要裁剪高度
+        new_h = int(w / ratio)
+        if pos < 0:
+            pos = 0.5
+        max_offset = h - new_h
+        y_offset = int(max_offset * max(0.0, min(1.0, pos)))
+        crop_box = (0, y_offset, w, y_offset + new_h)
+
+    img = img.crop(crop_box)
+
+    # 输出为 JPEG
+    output = io.BytesIO()
+    # 转换为 RGB（处理 RGBA/P 等模式）
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img.save(output, format="JPEG", quality=quality, optimize=True)
+    return output.getvalue(), "image/jpeg"
 
 # ============================================================
 # SQLite 数据库操作
@@ -616,7 +664,7 @@ async def get_image(
         with get_db() as conn:
             row = conn.execute("SELECT cover_url FROM movies WHERE id = ?", (movie_id,)).fetchone()
         if row:
-            target_url = row["cover_url"]
+            target_url = row["cover_url"] or ""
 
     # 本地找不到图片 URL → 回退到真实 MetaTube Server
     if not target_url and config.fallback_server:
@@ -625,25 +673,19 @@ async def get_image(
             "url": url, "ratio": ratio, "pos": pos,
             "auto": auto, "badge": badge, "quality": quality,
         }
-        fallback_data = await proxy_to_fallback(
-            f"/v1/images/{image_type}/{provider}/{image_id}",
-            fallback_params,
-        )
-        # 图片回退需要特殊处理：直接转发原始响应
-        if config.fallback_server:
-            try:
-                fallback_url = f"{config.fallback_server}/v1/images/{image_type}/{provider}/{image_id}"
-                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                    resp = await client.get(fallback_url, params=fallback_params)
-                    if resp.status_code == 200:
-                        content_type = resp.headers.get("content-type", "image/jpeg")
-                        return Response(
-                            content=resp.content,
-                            media_type=content_type,
-                            headers={"Cache-Control": "max-age=86400"},
-                        )
-            except Exception as e:
-                logger.warning("图片回退失败: %s", str(e))
+        try:
+            fallback_url = f"{config.fallback_server}/v1/images/{image_type}/{provider}/{image_id}"
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                resp = await client.get(fallback_url, params=fallback_params)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("content-type", "image/jpeg")
+                    return Response(
+                        content=resp.content,
+                        media_type=content_type,
+                        headers={"Cache-Control": "max-age=86400"},
+                    )
+        except Exception as e:
+            logger.warning("图片回退失败: %s", str(e))
 
     if not target_url:
         return error_response(404, "Image not found")
@@ -655,16 +697,29 @@ async def get_image(
                 "Referer": "https://javdb.com/",
             }
             resp = await client.get(target_url, headers=headers)
-            if resp.status_code == 200:
-                content_type = resp.headers.get("content-type", "image/jpeg")
-                return Response(
-                    content=resp.content,
-                    media_type=content_type,
-                    headers={"Cache-Control": "max-age=86400"},
-                )
-            else:
+            if resp.status_code != 200:
                 logger.warning("图片下载失败 [%d]: %s", resp.status_code, target_url)
                 return error_response(resp.status_code, "Image download failed")
+
+            image_data = resp.content
+            content_type = resp.headers.get("content-type", "image/jpeg")
+
+            # primary 类型未指定 ratio 时，默认使用 2:3 竖版海报比例
+            if ratio <= 0 and image_type == "primary":
+                ratio = 0.67
+
+            # 根据 ratio 和 pos 参数裁剪图片（用于 Primary/poster 竖版海报）
+            if ratio > 0:
+                try:
+                    image_data, content_type = crop_image(image_data, ratio, pos, quality)
+                except Exception as e:
+                    logger.warning("图片裁剪失败，返回原图: %s", str(e))
+
+            return Response(
+                content=image_data,
+                media_type=content_type,
+                headers={"Cache-Control": "max-age=86400"},
+            )
     except Exception as e:
         logger.error("图片代理错误: %s", str(e))
         return error_response(500, f"Image proxy error: {str(e)}", status_code=500)
