@@ -228,6 +228,11 @@ def crop_image(image_data: bytes, ratio: float, pos: float = -1, quality: int = 
 # 角标图片缓存（避免重复下载）
 _badge_cache: dict[str, bytes] = {}
 
+# 图片下载缓存（避免同一 URL 被 primary/thumb/backdrop 重复下载）
+# 结构: {url: (image_bytes, content_type, timestamp)}
+_image_download_cache: dict[str, tuple[bytes, str, float]] = {}
+_IMAGE_CACHE_TTL = 60  # 缓存 60 秒，足够覆盖同一次刮削的多个图片请求
+
 # 脚本所在目录
 _script_dir = Path(__file__).parent
 
@@ -829,18 +834,32 @@ async def get_image(
         return error_response(404, "Image not found")
 
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://javdb.com/",
-            }
-            resp = await client.get(target_url, headers=headers)
-            if resp.status_code != 200:
-                logger.warning("图片下载失败 [%d]: %s", resp.status_code, target_url)
-                return error_response(resp.status_code, "Image download failed")
+        now = datetime.now().timestamp()
 
-            image_data = resp.content
-            content_type = resp.headers.get("content-type", "image/jpeg")
+        # 检查图片下载缓存（避免同一 URL 被 primary/thumb/backdrop 重复下载）
+        cached = _image_download_cache.get(target_url)
+        if cached and (now - cached[2]) < _IMAGE_CACHE_TTL:
+            image_data, content_type = cached[0], cached[1]
+            logger.info("使用缓存图片: %s", target_url)
+        else:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "https://javdb.com/",
+                }
+                resp = await client.get(target_url, headers=headers)
+                if resp.status_code != 200:
+                    logger.warning("图片下载失败 [%d]: %s", resp.status_code, target_url)
+                    return error_response(resp.status_code, "Image download failed")
+
+                image_data = resp.content
+                content_type = resp.headers.get("content-type", "image/jpeg")
+
+                # 写入缓存并清理过期条目
+                expired = [k for k, v in _image_download_cache.items() if (now - v[2]) >= _IMAGE_CACHE_TTL]
+                for k in expired:
+                    del _image_download_cache[k]
+                _image_download_cache[target_url] = (image_data, content_type, now)
 
             # primary 类型未指定 ratio 时，默认使用 2:3 竖版海报比例
             if ratio <= 0 and image_type == "primary":
