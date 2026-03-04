@@ -861,30 +861,30 @@ async def get_image(
                     del _image_download_cache[k]
                 _image_download_cache[target_url] = (image_data, content_type, now)
 
-            # primary 类型未指定 ratio 时，默认使用 2:3 竖版海报比例
-            if ratio <= 0 and image_type == "primary":
-                ratio = 0.67
+        # primary 类型未指定 ratio 时，默认使用 2:3 竖版海报比例
+        if ratio <= 0 and image_type == "primary":
+            ratio = 0.67
 
-            # 根据 ratio 和 pos 参数裁剪图片（用于 Primary/poster 竖版海报）
-            if ratio > 0:
-                try:
-                    image_data, content_type = crop_image(image_data, ratio, pos, quality)
-                except Exception as e:
-                    logger.warning("图片裁剪失败，返回原图: %s", str(e))
+        # 根据 ratio 和 pos 参数裁剪图片（用于 Primary/poster 竖版海报）
+        if ratio > 0:
+            try:
+                image_data, content_type = crop_image(image_data, ratio, pos, quality)
+            except Exception as e:
+                logger.warning("图片裁剪失败，返回原图: %s", str(e))
 
-            # 叠加角标（如中文字幕标记）
-            if badge:
-                try:
-                    image_data, content_type = await overlay_badge(image_data, badge, quality)
-                    logger.info("已叠加角标: %s", badge)
-                except Exception as e:
-                    logger.warning("角标叠加失败，返回原图: %s", str(e))
+        # 叠加角标（如中文字幕标记）
+        if badge:
+            try:
+                image_data, content_type = await overlay_badge(image_data, badge, quality)
+                logger.info("已叠加角标: %s", badge)
+            except Exception as e:
+                logger.warning("角标叠加失败，返回原图: %s", str(e))
 
-            return Response(
-                content=image_data,
-                media_type=content_type,
-                headers={"Cache-Control": "max-age=86400"},
-            )
+        return Response(
+            content=image_data,
+            media_type=content_type,
+            headers={"Cache-Control": "max-age=86400"},
+        )
     except Exception as e:
         logger.error("图片代理错误: %s", str(e))
         return error_response(500, f"Image proxy error: {str(e)}", status_code=500)
