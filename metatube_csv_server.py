@@ -64,6 +64,7 @@ config = AppConfig()
 COLUMN_MAP = {
     "原始链接": "homepage",
     "当前标题": "title",
+    "翻译标题": "translated_title",
     "原标题": "original_title",
     "番号": "number",
     "发布日期": "release_date",
@@ -424,6 +425,10 @@ def import_csv_to_db(csv_path: str) -> int:
                 movie.get("preview_images_count", ""),
             )
 
+            final_title = movie.get("translated_title", "")
+            if not final_title:
+                final_title = movie.get("title", "")
+
             conn.execute(
                 """INSERT OR REPLACE INTO movies
                    (id, number, title, original_title, homepage, release_date, runtime,
@@ -433,7 +438,7 @@ def import_csv_to_db(csv_path: str) -> int:
                 (
                     number_upper,
                     number_upper,
-                    movie.get("title", ""),
+                    final_title,
                     movie.get("original_title", ""),
                     movie.get("homepage", ""),
                     release_date,
