@@ -1,7 +1,7 @@
 services:
   metatube-csv:
     build: .
-    container_name: metatube-csv-server
+    container_name: metatube-csv
     ports:
       - "8000:8000"
     volumes:
