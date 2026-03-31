@@ -59,26 +59,28 @@ class AppConfig:
 
 
 config = AppConfig()
+CSV_ENCODING = "utf-8-sig"
 
-# CSV 列名 → 内部字段名的映射
-COLUMN_MAP = {
-    "原始链接": "homepage",
-    "当前标题": "title",
-    "翻译标题": "translated_title",
-    "原标题": "original_title",
-    "番号": "number",
-    "发布日期": "release_date",
-    "时长": "runtime",
-    "导演": "director",
-    "片商": "maker",
-    "系列": "series",
-    "类别": "genres",
-    "演员": "actors",
-    "评分": "score",
-    "封面图": "cover_url",
-    "预告片": "preview_video_url",
-    "预览图": "preview_images_base",
-    "预览图数量": "preview_images_count",
+# 内部字段 → CSV 列名候选（按优先级）
+CSV_FIELD_SOURCES = {
+    "homepage": ("原始链接",),
+    "title": ("翻译标题", "当前标题", "原标题"),
+    "original_title": ("当前标题",),
+    "number": ("番号",),
+    "release_date": ("发布日期",),
+    "runtime": ("时长",),
+    "summary": ("简介",),
+    "director": ("导演",),
+    "maker": ("片商",),
+    "label": ("发行商",),
+    "series": ("系列",),
+    "genres": ("类别",),
+    "actors": ("演员",),
+    "score": ("评分",),
+    "cover_url": ("封面图",),
+    "preview_video_url": ("预告片",),
+    "preview_images_base": ("预览图",),
+    "preview_images_count": ("预览图数量",),
 }
 
 
@@ -144,6 +146,35 @@ def clean_actor_name(name: str) -> str:
     return re.sub(r"[♀♂]", "", name).strip()
 
 
+def normalize_csv_header(header: str) -> str:
+    """清理 CSV 表头，处理 BOM 和首尾空白"""
+    return header.replace("\ufeff", "").strip()
+
+
+def clean_csv_value(value: str) -> str:
+    """清理 CSV 单元格值"""
+    return value.strip().replace("\x00", "") if value else ""
+
+
+def build_row_lookup(headers: list[str], values: list[str]) -> dict[str, list[str]]:
+    """保留重复表头，避免 DictReader 丢失同名列"""
+    lookup: dict[str, list[str]] = {}
+    for index, header in enumerate(headers):
+        if not header:
+            continue
+        lookup.setdefault(header, []).append(clean_csv_value(values[index]) if index < len(values) else "")
+    return lookup
+
+
+def pick_csv_value(row_lookup: dict[str, list[str]], *headers: str) -> str:
+    """按优先级选取第一个非空 CSV 值"""
+    for header in headers:
+        for value in row_lookup.get(header, []):
+            if value:
+                return value
+    return ""
+
+
 def generate_preview_images(base_url: str, count_str: str) -> list[str]:
     """根据预览图基础 URL 和数量生成所有预览图 URL"""
     if not base_url or not count_str:
@@ -152,16 +183,18 @@ def generate_preview_images(base_url: str, count_str: str) -> list[str]:
         count = int(count_str)
     except ValueError:
         return []
-    match = re.search(r"(_l_)(\d+)(\.jpg)", base_url)
+    if count <= 0:
+        return []
+    match = re.search(r"(_l_)(\d+)(\.[^.?#]+(?:\?[^#]*)?)$", base_url)
     if match:
         prefix = base_url[: match.start(2)]
         suffix = base_url[match.end(2) :]
-        return [f"{prefix}{i}{suffix}" for i in range(1, count + 1)]
+        return [f"{prefix}{i}{suffix}" for i in range(count)]
     return [base_url]
 
 
 def detect_encoding(filepath: Path) -> str:
-    """读取文件头部检测编码"""
+    """优先按 UTF-8 检测，兼容 BOM / UTF-16 / GB 系编码"""
     raw = filepath.read_bytes()[:8192]
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return "utf-16"
@@ -173,8 +206,8 @@ def detect_encoding(filepath: Path) -> str:
     except UnicodeDecodeError:
         pass
     try:
-        raw.decode("gbk")
-        return "gbk"
+        raw.decode("gb18030")
+        return "gb18030"
     except UnicodeDecodeError:
         pass
     return "utf-8"
@@ -372,9 +405,15 @@ def init_db():
         """)
         # 数据库迁移：为旧表补充缺失的列
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(movies)").fetchall()}
-        if "original_title" not in existing_cols:
-            conn.execute("ALTER TABLE movies ADD COLUMN original_title TEXT DEFAULT ''")
-            logger.info("数据库迁移：添加 original_title 列")
+        migration_columns = {
+            "original_title": "TEXT DEFAULT ''",
+            "label": "TEXT DEFAULT ''",
+            "summary": "TEXT DEFAULT ''",
+        }
+        for column_name, column_def in migration_columns.items():
+            if column_name not in existing_cols:
+                conn.execute(f"ALTER TABLE movies ADD COLUMN {column_name} {column_def}")
+                logger.info("数据库迁移：添加 %s 列", column_name)
         # 创建搜索索引
         conn.execute("CREATE INDEX IF NOT EXISTS idx_number ON movies(number)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_title ON movies(title)")
@@ -388,19 +427,30 @@ def import_csv_to_db(csv_path: str) -> int:
         logger.error("CSV 文件不存在: %s", csv_path)
         sys.exit(1)
 
-    encoding = detect_encoding(path)
-    logger.info("检测到编码: %s", encoding)
+    encoding = CSV_ENCODING
+    logger.info("使用固定编码读取 CSV: %s", encoding)
 
     count = 0
 
-    with get_db() as conn, open(path, "r", encoding=encoding, errors="replace") as f:
-        reader = csv.DictReader(f)
+    with get_db() as conn, open(path, "r", encoding=encoding, errors="replace", newline="") as f:
+        reader = csv.reader(f)
+        headers = next(reader, [])
+        headers = [normalize_csv_header(header) for header in headers]
+        if not headers:
+            logger.warning("CSV 文件为空: %s", csv_path)
+            return 0
+
+        logger.info("已加载 %d 个 CSV 表头", len(headers))
+
         for row in reader:
-            # 映射字段
-            movie = {}
-            for csv_col, field_name in COLUMN_MAP.items():
-                val = row.get(csv_col, "")
-                movie[field_name] = val.strip().replace("\x00", "") if val else ""
+            row_lookup = build_row_lookup(headers, row)
+            movie = {
+                field_name: pick_csv_value(row_lookup, *csv_headers)
+                for field_name, csv_headers in CSV_FIELD_SOURCES.items()
+            }
+
+            if not movie["original_title"]:
+                movie["original_title"] = movie["title"]
 
             number = movie.get("number", "").strip()
             if not number:
@@ -425,10 +475,6 @@ def import_csv_to_db(csv_path: str) -> int:
                 movie.get("preview_images_count", ""),
             )
 
-            final_title = movie.get("translated_title", "")
-            if not final_title:
-                final_title = movie.get("title", "")
-
             conn.execute(
                 """INSERT OR REPLACE INTO movies
                    (id, number, title, original_title, homepage, release_date, runtime,
@@ -438,7 +484,7 @@ def import_csv_to_db(csv_path: str) -> int:
                 (
                     number_upper,
                     number_upper,
-                    final_title,
+                    movie.get("title", ""),
                     movie.get("original_title", ""),
                     movie.get("homepage", ""),
                     release_date,
@@ -452,8 +498,8 @@ def import_csv_to_db(csv_path: str) -> int:
                     movie.get("cover_url", ""),
                     movie.get("preview_video_url", ""),
                     json.dumps(preview_images, ensure_ascii=False),
-                    "",
-                    "",
+                    movie.get("label", ""),
+                    movie.get("summary", ""),
                 ),
             )
             count += 1
