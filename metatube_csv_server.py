@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, unquote_plus, urlparse
 
 from PIL import Image
 
@@ -112,6 +113,121 @@ def strip_number_suffix(number: str) -> str:
 def escape_like(value: str) -> str:
     """转义 LIKE 查询中的特殊字符（%, _, \）"""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def extract_magnet_dn(magnet_url: str) -> str:
+    """从 magnet 链接中提取 dn 参数。"""
+    if not magnet_url:
+        return ""
+    try:
+        query = urlparse(magnet_url).query
+        values = parse_qs(query).get("dn", [])
+        if values:
+            return unquote_plus(values[0]).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def strip_known_file_extension(name: str) -> str:
+    """剥离常见下载/视频扩展名，便于拿到更稳定的别名。"""
+    if not name:
+        return ""
+    result = name.strip()
+    for ext in (".TORRENT", ".MP4", ".MKV", ".AVI", ".WMV", ".MOV", ".TS", ".M2TS", ".ISO"):
+        if result.upper().endswith(ext):
+            return result[: -len(ext)].strip()
+    return result
+
+
+def clean_magnet_dn_name(name: str) -> str:
+    """清洗 magnet dn 名称中的常见噪声，只保留更接近番号的部分。"""
+    if not name:
+        return ""
+
+    result = strip_known_file_extension(name).strip()
+
+    # 形如 第一會所新片@SIS001@NAMH-056-4K，只保留最后一个 @ 后面的部分
+    if "@" in result:
+        result = result.rsplit("@", 1)[-1].strip()
+
+    # 形如 START-498-UC.无码破解，只保留点号前的番号部分
+    dot_head = result.split(".", 1)[0].strip()
+    if dot_head and re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", dot_head.upper()):
+        result = dot_head
+
+    return result.strip()
+
+
+def build_magnet_aliases(magnet_url: str) -> list[str]:
+    """从第一个磁力链接中构建可用于匹配的别名列表。"""
+    dn = extract_magnet_dn(magnet_url)
+    if not dn:
+        return []
+
+    aliases = []
+    seen = set()
+
+    def add(value: str):
+        alias = value.strip().upper()
+        if alias and alias not in seen:
+            seen.add(alias)
+            aliases.append(alias)
+
+    cleaned_name = clean_magnet_dn_name(dn)
+    add(cleaned_name)
+
+    # 额外提取 dn 中的番号形片段，例如 START-498-UC.无码破解 -> START-498-UC
+    for match in re.findall(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", cleaned_name.upper()):
+        add(match)
+
+    return aliases
+
+
+def find_movies_by_alias(conn: sqlite3.Connection, alias: str) -> list[sqlite3.Row]:
+    """通过磁力 dn 别名查找影片。"""
+    alias_upper = alias.strip().upper()
+    if not alias_upper:
+        return []
+    rows = conn.execute(
+        """
+        SELECT DISTINCT m.*
+        FROM movie_aliases a
+        JOIN movies m ON m.id = a.movie_id
+        WHERE a.alias = ?
+        ORDER BY m.id
+        LIMIT 20
+        """,
+        (alias_upper,),
+    ).fetchall()
+    return rows
+
+
+def build_query_number_candidates(query: str) -> list[str]:
+    """为查询值构造额外番号候选，优先保守处理 FC2PPV 版本尾缀。"""
+    query_upper = query.strip().upper()
+    if not query_upper:
+        return []
+
+    candidates = []
+    seen = set()
+
+    def add(value: str):
+        candidate = value.strip().upper()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+
+    add(query_upper)
+
+    # FC2PPV-4861886-1 / FC2-PPV-4861886-1 -> FC2PPV-4861886 / FC2-PPV-4861886
+    match = re.match(r"^(FC2)(?:-?PPV)-(\d+)-\d+$", query_upper)
+    if match:
+        number = match.group(2)
+        add(f"FC2PPV-{number}")
+        add(f"FC2-PPV-{number}")
+
+    return candidates
 
 
 def parse_runtime(raw: str) -> int:
@@ -403,6 +519,13 @@ def init_db():
                 summary TEXT DEFAULT ''
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS movie_aliases (
+                alias TEXT NOT NULL,
+                movie_id TEXT NOT NULL,
+                PRIMARY KEY (alias, movie_id)
+            )
+        """)
         # 数据库迁移：为旧表补充缺失的列
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(movies)").fetchall()}
         migration_columns = {
@@ -417,6 +540,8 @@ def init_db():
         # 创建搜索索引
         conn.execute("CREATE INDEX IF NOT EXISTS idx_number ON movies(number)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_title ON movies(title)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_movie_alias_alias ON movie_aliases(alias)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_movie_alias_movie_id ON movie_aliases(movie_id)")
         conn.commit()
 
 
@@ -431,8 +556,10 @@ def import_csv_to_db(csv_path: str) -> int:
     logger.info("使用固定编码读取 CSV: %s", encoding)
 
     count = 0
+    alias_count = 0
 
     with get_db() as conn, open(path, "r", encoding=encoding, errors="replace", newline="") as f:
+        conn.execute("DELETE FROM movie_aliases")
         reader = csv.reader(f)
         headers = next(reader, [])
         headers = [normalize_csv_header(header) for header in headers]
@@ -448,6 +575,7 @@ def import_csv_to_db(csv_path: str) -> int:
                 field_name: pick_csv_value(row_lookup, *csv_headers)
                 for field_name, csv_headers in CSV_FIELD_SOURCES.items()
             }
+            magnet_1 = pick_csv_value(row_lookup, "磁力1链接")
 
             if not movie["original_title"]:
                 movie["original_title"] = movie["title"]
@@ -502,15 +630,23 @@ def import_csv_to_db(csv_path: str) -> int:
                     movie.get("summary", ""),
                 ),
             )
+
+            for alias in build_magnet_aliases(magnet_1):
+                conn.execute(
+                    "INSERT OR REPLACE INTO movie_aliases (alias, movie_id) VALUES (?, ?)",
+                    (alias, number_upper),
+                )
+                alias_count += 1
+
             count += 1
             # 每 10000 条提交一次，平衡速度和内存
             if count % 10000 == 0:
                 conn.commit()
-                logger.info("已导入 %d 条记录...", count)
+                logger.info("已导入 %d 条记录，磁力别名 %d 条...", count, alias_count)
 
         conn.commit()
 
-    logger.info("CSV 导入完成，共 %d 条记录", count)
+    logger.info("CSV 导入完成，共 %d 条记录，磁力别名 %d 条", count, alias_count)
     return count
 
 
@@ -647,16 +783,30 @@ async def search_movies(
     query_upper = query.upper()
     # 去除横杠空格的版本，用于模糊匹配
     query_clean = re.sub(r"[-_\s]", "", query_upper)
+    query_candidates = build_query_number_candidates(query)
 
     results = []
 
     with get_db() as conn:
-        # 1. 精确匹配番号
-        row = conn.execute("SELECT * FROM movies WHERE id = ?", (query_upper,)).fetchone()
-        if row:
-            results.append(row_to_search_result(row))
+        # 1. 磁力 dn 别名匹配
+        for candidate in query_candidates:
+            alias_rows = find_movies_by_alias(conn, candidate)
+            if alias_rows:
+                results.extend(row_to_search_result(r) for r in alias_rows)
+                logger.info("磁力别名匹配: %s → %s", candidate, ", ".join(r["id"] for r in alias_rows[:3]))
+                break
 
-        # 2. 去后缀匹配（如 EYAN-197-U → EYAN-197）
+        # 2. 精确匹配番号
+        if not results:
+            for candidate in query_candidates:
+                row = conn.execute("SELECT * FROM movies WHERE id = ?", (candidate,)).fetchone()
+                if row:
+                    results.append(row_to_search_result(row))
+                    if candidate != query_upper:
+                        logger.info("候选番号匹配: %s → %s", query_upper, candidate)
+                    break
+
+        # 3. 去后缀匹配（如 EYAN-197-U → EYAN-197）
         if not results:
             stripped = strip_number_suffix(query_upper)
             if stripped != query_upper:
@@ -665,7 +815,7 @@ async def search_movies(
                     results.append(row_to_search_result(row))
                     logger.info("后缀剥离匹配: %s → %s", query_upper, stripped)
 
-        # 3. 模糊匹配番号（LIKE，转义特殊字符）
+        # 4. 模糊匹配番号（LIKE，转义特殊字符）
         if not results:
             escaped = escape_like(query_upper)
             rows = conn.execute(
@@ -674,7 +824,7 @@ async def search_movies(
             ).fetchall()
             results.extend(row_to_search_result(r) for r in rows)
 
-        # 4. 标题匹配（LIKE，转义特殊字符）
+        # 5. 标题匹配（LIKE，转义特殊字符）
         if not results:
             escaped_title = escape_like(query)
             rows = conn.execute(
@@ -683,7 +833,7 @@ async def search_movies(
             ).fetchall()
             results.extend(row_to_search_result(r) for r in rows)
 
-        # 5. 去横杠匹配（如 IENF431 匹配 IENF-431）
+        # 6. 去横杠匹配（如 IENF431 匹配 IENF-431）
         if not results and query_clean:
             rows = conn.execute(
                 "SELECT * FROM movies WHERE REPLACE(REPLACE(id, '-', ''), '_', '') = ?",
@@ -691,7 +841,7 @@ async def search_movies(
             ).fetchall()
             results.extend(row_to_search_result(r) for r in rows)
 
-        # 6. 去后缀 + 去横杠匹配
+        # 7. 去后缀 + 去横杠匹配
         if not results:
             stripped_clean = re.sub(r"[-_\s]", "", strip_number_suffix(query_upper))
             if stripped_clean != query_clean:
@@ -701,7 +851,7 @@ async def search_movies(
                 ).fetchall()
                 results.extend(row_to_search_result(r) for r in rows)
 
-    # 7. 本地查不到 → 回退到真实 MetaTube Server
+    # 8. 本地查不到 → 回退到真实 MetaTube Server
     if not results and config.fallback_server:
         logger.info("本地未找到 '%s'，回退到真实服务端...", query)
         fallback_data = await proxy_to_fallback(
@@ -723,17 +873,48 @@ async def get_movie_info(
 ):
     """获取影片详情"""
     movie_id_upper = movie_id.strip().upper()
+    provider_name = provider.strip()
+    movie_id_candidates = build_query_number_candidates(movie_id)
 
     with get_db() as conn:
-        row = conn.execute("SELECT * FROM movies WHERE id = ?", (movie_id_upper,)).fetchone()
+        row = None
+        matched_candidate = movie_id_upper
+        for candidate in movie_id_candidates:
+            row = conn.execute("SELECT * FROM movies WHERE id = ?", (candidate,)).fetchone()
+            if row:
+                matched_candidate = candidate
+                break
+        if not row:
+            for candidate in movie_id_candidates:
+                alias_rows = find_movies_by_alias(conn, candidate)
+                if len(alias_rows) == 1:
+                    row = alias_rows[0]
+                    matched_candidate = candidate
+                    logger.info("详情磁力别名匹配: %s → %s", candidate, row["id"])
+                    break
         if row:
+            if matched_candidate != movie_id_upper:
+                logger.info("详情候选番号匹配: %s → %s", movie_id_upper, matched_candidate)
             logger.info("获取详情: %s", movie_id_upper)
             return success_response(row_to_info(row))
 
     # 本地查不到 → 回退到真实 MetaTube Server
     if config.fallback_server:
         logger.info("本地未找到 '%s'，回退到真实服务端...", movie_id)
+        # 调用方已提供真实 provider 时，先直接请求详情，避免额外 search。
+        # 只有 provider 缺失/为本地 provider，或直连失败时，再搜索反查真实 provider。
+        if provider_name and provider_name != config.provider:
+            logger.info("直接回退详情: provider=%s, id=%s", provider_name, movie_id_upper)
+            fallback_data = await proxy_to_fallback(
+                f"/v1/movies/{provider_name}/{movie_id_upper}",
+                {"lazy": lazy},
+            )
+            if fallback_data and fallback_data.get("data"):
+                return JSONResponse(content=fallback_data)
+            logger.info("直接回退详情失败，改为搜索反查: provider=%s, id=%s", provider_name, movie_id_upper)
+
         # 先搜索获取真实的 provider 和 id
+        logger.info("回退前搜索反查: %s", movie_id_upper)
         search_data = await proxy_to_fallback(
             "/v1/movies/search",
             {"q": movie_id, "provider": "", "fallback": "true"},
@@ -997,13 +1178,15 @@ def main():
     # 判断是否需要导入 CSV
     with get_db() as conn:
         count = conn.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
+        alias_count = conn.execute("SELECT COUNT(*) FROM movie_aliases").fetchone()[0]
 
     # 自动检测 CSV 文件是否比数据库更新
     csv_mtime = os.path.getmtime(args.csv) if os.path.exists(args.csv) else 0
     db_mtime = os.path.getmtime(config.db_path) if os.path.exists(config.db_path) else 0
     csv_newer = csv_mtime > db_mtime
+    alias_missing = count > 0 and alias_count == 0
 
-    if count == 0 or args.reimport or csv_newer:
+    if count == 0 or args.reimport or csv_newer or alias_missing:
         if args.reimport and count > 0:
             logger.info("强制重新导入，清空现有数据...")
             with get_db() as conn:
@@ -1014,6 +1197,8 @@ def main():
             with get_db() as conn:
                 conn.execute("DELETE FROM movies")
                 conn.commit()
+        elif alias_missing:
+            logger.info("检测到磁力别名索引为空，自动重建别名映射...")
         logger.info("开始导入 CSV: %s", args.csv)
         import_csv_to_db(args.csv)
     else:
