@@ -1,5 +1,6 @@
 services:
   metatube-csv:
+    image: metatube-csv:latest
     build: .
     container_name: metatube-csv
     ports:

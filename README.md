@@ -38,7 +38,7 @@ docker compose up -d --build
 docker image prune -f
 
 # 5. 查看日志
-docker logs -f metatube-csv-server
+docker logs -f metatube-csv
 ```
 
 ### 本地运行

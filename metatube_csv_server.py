@@ -220,12 +220,15 @@ def build_query_number_candidates(query: str) -> list[str]:
 
     add(query_upper)
 
-    # FC2PPV-4861886-1 / FC2-PPV-4861886-1 -> FC2PPV-4861886 / FC2-PPV-4861886
-    match = re.match(r"^(FC2)(?:-?PPV)-(\d+)-\d+$", query_upper)
+    # FC2PPV-4861886-1 / FC2-PPV-4861886-1 / FC2PPV-4861886_1 / FC2PPV-4861886_SP
+    # -> FC2PPV-4861886 / FC2-PPV-4861886 / FC2-4861886 
+    match = re.match(r"^(FC2)(?:-?PPV)-(\d+)(?:[-_][A-Z0-9]+)*$", query_upper)
     if match:
         number = match.group(2)
         add(f"FC2PPV-{number}")
         add(f"FC2-PPV-{number}")
+        # 识别时额外剔除 PPV，兼容仅保留 FC2 的编号格式
+        add(f"FC2-{number}")
 
     return candidates
 
